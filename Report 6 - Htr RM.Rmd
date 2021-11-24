@@ -1,0 +1,196 @@
+---
+title: "Naive Bayes & Text Mining"
+author:
+- name: Heitor Gabriel S. Monteiro
+output:
+  html_document:
+    highlight: tango
+    theme: cerulean
+    number_sections: yes
+    toc: yes
+    toc_float:
+      collapsed: yes
+      smooth_scroll: no
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+    number_sections: yes
+    citation_package: natbib
+    keep_tex: yes
+    fig_caption: yes
+    latex_engine: pdflatex
+    template: /home/heitor/Documentos/Economia/Meus Trabalhos/Dissertação/Escritas/RMdDissert/svm-latex-ms.tex
+header-includes: \usepackage{hyperref}
+geometry: margin=1in
+fontfamily: mathpazo
+fontsize: 11pt
+endnote: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Exercício Proposto.
+Exercitar as funções de mineração de texto e comparar diferentes configurações de Naive Bayes, com distribuição Bernoulli, de Laplace 0 e 1.   
+Usaremos os pacotes e fixaremos o diretório de trabalho:
+
+```{r message=FALSE, warning=FALSE}
+setwd("/home/heitor/Área de Trabalho/R Projects/Análise Macro/Lab 6")
+library(tidyverse)   # standard
+library(tidymodels)  # standard
+library(tm)          # text mining
+library(SnowballC)   # to stemming words
+library(wordcloud2)  # make words visualizations, the input have to be a data.frame
+library(naivebayes)  # naive bayes procedures
+library(gmodels)     # to tabulate results
+library(knitr)
+```
+
+# Importação e Tratamento
+
+Importamos os [dados]([https://www.kaggle.com/uciml/sms-spam-collection-dataset) de mais de cinco mil mensagens clasificadas em `spam` e `ham`, transformamos essa classificação em fator:
+
+```{r message=FALSE, warning=FALSE}
+dd <- read_csv("sms_spam.csv") %>% as_tibble()
+dd$type <- as.factor(dd$type)
+```
+
+
+```{r}
+dd %>% glimpse()
+dd %>% summary()
+```
+
+Transformaremos os arquivos de texto em um *corpus volátil*, que é totalmente mantido na memória e, portanto, todas as alterações afetam apenas tal objeto.
+
+```{r}
+dd_corpus1 <- VCorpus(VectorSource(dd$text))
+```
+
+Faremos uma função de limpeza dos dados de texto e a aplicaremos sobre nosso *Corpus*, gerando um novo corpus, `dd_corpus2`. Na limpeza vamos:
+   1. remover pontuação;
+   2. remover espaços em branco;
+   3. transformar qualquer caractere que ainda não esteja no padrão UTF-8;
+   4. remover números;
+   5. remover palavras que são meros conectivos;
+   6. padronizar tudo para minúsculos;
+   7. remover verbetes e abreviações em latim;
+   8. reduzir os vocábulos ao seu radical:
+
+```{r}
+clean_corpus <- function(corpus_to_use){
+  corpus_to_use %>%
+    tm_map(removePunctuation) %>%
+    tm_map(stripWhitespace) %>%
+    tm_map(content_transformer(function(x) iconv(x, to='UTF-8', sub='byte'))) %>%
+    tm_map(removeNumbers) %>%
+    tm_map(removeWords, stopwords("en")) %>%
+    tm_map(content_transformer(tolower)) %>%
+    tm_map(removeWords, c("etc","ie", "eg", stopwords("english"))) %>% 
+    tm_map(stemDocument)
+}
+dd_corpus2 <- clean_corpus(dd_corpus1)
+remove(dd_corpus1)
+```
+
+# Tabela de Frequência e Visualização
+
+Faremos, com os dados limpos, uma matriz com cada e-mail como observação, nas linhas, e as palavras como variáveis, nas colunas. Tal objeto é chamado de *DTM*. Após, contaremos a incidência de cada palavra em cada documento e somaremos as aparições totais.
+
+```{r}
+find_freq_terms_fun <- function(corpus_in){
+   dd_dtm        <- DocumentTermMatrix(corpus_in)
+   freq_terms    <- findFreqTerms(dd_dtm)[1:max(dd_dtm$ncol)]
+   terms_grouped <- dd_dtm[,freq_terms] %>%
+     as.matrix() %>%
+     colSums() %>%
+     data.frame(Term=freq_terms, Frequency = .) %>%
+     arrange(desc(Frequency)) %>%
+     mutate(prop_term_to_total_terms=Frequency/nrow(.))
+   return(data.frame(terms_grouped))
+}
+freq_terms_crp <- data.frame(find_freq_terms_fun(dd_corpus2))
+head(freq_terms_crp, n=10)
+```
+
+Agora, faremos a visualização da nuvem de palavras usadas. Antes, retiraremos as palavras com menor freqência, para não poluir a visualização.
+
+```{r, fig.align='center', fig.width=9}
+wc1 <- wordcloud2(freq_terms_crp[,1:2] %>%
+                    filter(freq_terms_crp$Frequency>35),
+                  shape="circle",
+                  color="random-light",
+                  backgroundColor = "black")
+wc1
+```
+
+
+\newpage
+# Divisão entre Teste e Treino
+
+```{r}
+dtm <- DocumentTermMatrix(dd_corpus2)
+dtm_train <- dtm[1:4169, ]
+dtm_test  <- dtm[4170:5559, ]
+```
+
+Repararemos se ambos têm a mesta proporção para os fatores:
+
+```{r}
+train_type <- dd[1:4169, ]$type
+test_type  <- dd[4170:5559, ]$type
+prop.table(table(train_type))
+prop.table(table(train_type))
+```
+
+Assim como retiramos as palavras infrequentes dos dados para a visualização, faremos o mesmo nas amostras de treino e teste:
+
+```{r}
+freq_words <- findFreqTerms(dtm_train, 5)
+
+dtm_train2 <- dtm_train [ , freq_words]
+dtm_test2  <- dtm_test  [ , freq_words]
+
+remove(dtm_train, dtm_test)
+```
+
+O modelo precisa de variáveis-fatores para rodar. Transformaremos a frequência de aparição dos termos em somente *sim* ou *não*, caso tenha ou não aparecido na mensagem, aplicando uma função que criaremos. 
+
+```{r}
+convert_counts <- function(x) {
+  x <- ifelse(x > 0, "Yes", "No")
+}
+
+dd_train <- apply(dtm_train2, MARGIN = 2, convert_counts)
+dd_test  <- apply(dtm_test2,  MARGIN = 2, convert_counts)
+```
+
+
+# Aplicando o Modelo
+
+Meus exercícios anteriores mostraram que mudar o uso do kernel e da distribuição de poisson não mudam o resultado, então, temos um modelo somente:
+
+```{r}
+nb1 <- naive_bayes(x = dd_train,
+                   y = train_type,
+                   laplace= 1,
+                   usepoisson = T,
+                   usekernel = T)
+
+tables(nb1, c('call', 'pay', 'free', 'now'))
+```
+
+Vemos que o nosso modelo `nb1` alcançou 97.7% de acerto!
+
+```{r}
+tst1 <- predict(nb1, dd_test,
+                type= 'class')
+
+CrossTable(tst1, test_type,
+           prop.chisq = FALSE,
+           prop.t = T,
+           prop.r = F,
+           prop.c = F,
+           dnn = c('predicted', 'actual'))
+```
